@@ -1,7 +1,11 @@
-"""Perform multiple asynchronous queries to the HTTP server.
+"""Asynchronous HTTP server benchmark application.
 
-:author: vovanec@gmail.com
+Based on http://curl.haxx.se/mail/curlpython-2010-08/att-0002/retriever-multi.py
+recipe.
 """
+
+__author__ = 'vovanec@gmail.com'
+
 
 import argparse
 import concurrent.futures
@@ -23,14 +27,11 @@ DEF_NUM_CONNECTIONS = 10
 # Curl connection timeout, seconds
 DEF_CONNECTION_TIMEOUT = 15
 
-# Either to use Curl in verbose mode.
-VERBOSE = False
-
 INFINITY = float('inf')
 
 
 class HTTPQueryEngine(object):
-    """Perform multiple asynchronous queries to the server.
+    """Asynchronous HTTP query engine.
     """
 
     def __init__(self, url, *, num_connections=DEF_NUM_CONNECTIONS,
@@ -47,27 +48,27 @@ class HTTPQueryEngine(object):
 
         self.log = logging.getLogger(self.__class__.__name__)
 
-        self.handles = []
-        for _ in range(num_connections):
-            self.handles.append(self.__make_curl_handle(timeout))
-
-        self.freelist = self.handles[:]
-        self.curl = pycurl.CurlMulti()
-        self.url = url
         self.keep_alive_conn = keep_alive_conn
+        self.url = url
 
-    def run(self, *, num_requests=INFINITY):
-        """Perform multiple asynchronous queries to the server.
+        self.curl_multi = pycurl.CurlMulti()
+
+        self.curl_handles = []
+        for _ in range(num_connections):
+            self.curl_handles.append(self._curl_handle_create(timeout))
+
+        self.free_pool = self.curl_handles[:]
+
+    def __call__(self, *, num_requests=INFINITY):
+        """Run query engine.
 
         :rtype: dict
         :return: results dict.
         """
 
-        if self.handles is None:
+        if self.curl_handles is None:
             raise Exception('Operation on closed object.')
 
-        num_submitted = 0
-        num_processed = 0
         result = {'req_total': 0,
                   'http_ok': 0,
                   'http_error': 0,
@@ -75,40 +76,46 @@ class HTTPQueryEngine(object):
                   '__response_times': []}
 
         self.log.info('Querying %s with %s simultaneous connections...',
-                      self.url, len(self.handles))
+                      self.url, len(self.curl_handles))
 
+        num_in_progress = 0
+        num_finished = 0
+        
         time_start = time.time()
         try:
-            while num_processed < num_requests:
-                while self.freelist and (num_submitted < num_requests):
-                    handle = self.freelist.pop()
-                    self.__submit_curl_handle(handle)
-                    num_submitted += 1
-                self.__curl_perform()
-                num_processed += self.__collect_result_stats(result)
+            while num_finished < num_requests:
+                while self.free_pool and (num_in_progress < num_requests):
+                    handle = self.free_pool.pop()
+                    self._curl_handle_submit(handle)
+                    num_in_progress += 1
 
-                self.curl.select(0.1)
+                ret = pycurl.E_CALL_MULTI_PERFORM
+                while ret == pycurl.E_CALL_MULTI_PERFORM:
+                    ret, _ = self.curl_multi.perform()
+
+                num_finished += self._collect_stats(result)
+
+                self.curl_multi.select(0.1)
         except KeyboardInterrupt:
             self.log.info('Done.')
 
-        return self.__make_summary_dict(result, time_start)
+        return self._make_summary_dict(result, time_start)
 
     def close(self):
-        """Close all open handles. CurlMultiQuery object becomes
-        unusable after this call.
+        """Close all open handles.
         """
 
-        if self.handles is None:
+        if self.curl_handles is None:
             raise Exception('Operation on closed object.')
 
-        for handle in self.handles:
-            handle.close()
+        for curl_handle in self.curl_handles:
+            curl_handle.close()
 
-        self.curl.close()
+        self.curl_multi.close()
 
-        self.handles = None
-        self.freelist = None
-        self.curl = None
+        self.curl_handles = None
+        self.free_pool = None
+        self.curl_multi = None
 
     def __enter__(self):
         return self
@@ -116,42 +123,58 @@ class HTTPQueryEngine(object):
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
-    def __submit_curl_handle(self, handle, *, request_headers=None):
-        """Allocate new curl handle and submit it for processing.
+    @staticmethod
+    def _curl_handle_create(timeout):
+        """Create new curl handle.
+
+        :param int timeout: connection timeout.
         """
 
-        handle.body = BytesIO()
-        handle.headers = BytesIO()
-        self.__add_req_headers(handle, keep_alive_conn=self.keep_alive_conn,
-                               headers=request_headers)
-        handle.setopt(pycurl.URL, self.url)
-        handle.setopt(pycurl.WRITEFUNCTION, handle.body.write)
-        handle.setopt(pycurl.HEADERFUNCTION, handle.headers.write)
+        curl_handle = pycurl.Curl()
+        curl_handle.body = None
 
-        handle.start_ts = time.time()
+        curl_handle.setopt(pycurl.NOSIGNAL, 1)
+        curl_handle.setopt(pycurl.IPRESOLVE, pycurl.IPRESOLVE_V4)
+        curl_handle.setopt(pycurl.CONNECTTIMEOUT, timeout)
+        curl_handle.setopt(pycurl.TIMEOUT, timeout)
+        curl_handle.setopt(pycurl.USERAGENT, USER_AGENT)
 
-        self.curl.add_handle(handle)
+        return curl_handle
 
-    def __free_curl_handle(self, handle):
-        """Return curl handle to the freelist.
+    def _curl_handle_submit(self, curl_handle, *, request_headers=None):
+        """Submit curl handle for polling.
+
+        :param pycurl.Curl curl_handle: curl handle.
+        :param dict request_headers: HTTP request headers.
         """
 
-        handle.body = None
-        handle.headers = None
-        handle.start_ts = None
+        curl_handle.body = BytesIO()
+        curl_handle.headers = BytesIO()
+        self._add_req_headers(curl_handle, keep_alive_conn=self.keep_alive_conn,
+                              headers=request_headers)
+        curl_handle.setopt(pycurl.URL, self.url)
+        curl_handle.setopt(pycurl.WRITEFUNCTION, curl_handle.body.write)
+        curl_handle.setopt(pycurl.HEADERFUNCTION, curl_handle.headers.write)
 
-        self.curl.remove_handle(handle)
-        self.freelist.append(handle)
+        curl_handle.start_ts = time.time()
 
-    def __curl_perform(self):
-        """Run the internal curl state machine for the multi stack.
+        self.curl_multi.add_handle(curl_handle)
+
+    def _curl_handle_free(self, curl_handle):
+        """Free curl handle.
+
+        :param pycurl.Curl curl_handle: curl handle.
+        :return:
         """
 
-        ret = pycurl.E_CALL_MULTI_PERFORM
-        while ret == pycurl.E_CALL_MULTI_PERFORM:
-            ret, _ = self.curl.perform()
+        curl_handle.body = None
+        curl_handle.headers = None
+        curl_handle.start_ts = None
 
-    def __collect_result_stats(self, result):
+        self.curl_multi.remove_handle(curl_handle)
+        self.free_pool.append(curl_handle)
+
+    def _collect_stats(self, result):
         """Check for curl objects which have terminated, collect
         result and add them to the freelist.
 
@@ -163,7 +186,7 @@ class HTTPQueryEngine(object):
         queries_finished = 0
 
         while True:
-            num_q, ok_list, err_list = self.curl.info_read()
+            num_q, ok_list, err_list = self.curl_multi.info_read()
             for handle in ok_list:
                 status_code = handle.getinfo(pycurl.HTTP_CODE)
 
@@ -181,12 +204,12 @@ class HTTPQueryEngine(object):
                     result['http_error'] += 1
 
                 result['__response_times'].append(resp_time)
-                self.__free_curl_handle(handle)
+                self._curl_handle_free(handle)
 
             for handle, errno, errmsg in err_list:
                 self.log.warning('Query for %s failed: %s, %s',
                                  self.url, errno, errmsg)
-                self.__free_curl_handle(handle)
+                self._curl_handle_free(handle)
 
             queries_finished += (len(ok_list) + len(err_list))
             result['req_total'] += queries_finished
@@ -198,37 +221,10 @@ class HTTPQueryEngine(object):
         return queries_finished
 
     @staticmethod
-    def __make_curl_handle(timeout):
-        """Create Curl handle.
-
-        :param int timeout: connection timeout.
-        """
-
-        handle = pycurl.Curl()
-
-        handle.setopt(pycurl.NOSIGNAL, 1)
-        handle.setopt(pycurl.CONNECTTIMEOUT, timeout)
-        handle.setopt(pycurl.TIMEOUT, timeout)
-        handle.setopt(pycurl.IPRESOLVE, pycurl.IPRESOLVE_V4)
-        handle.setopt(pycurl.USERAGENT, USER_AGENT)
-
-        # Set verbose mode for Curl if needed.
-        if VERBOSE:
-            def curl_debug_function(debug_type, debug_msg):
-                if debug_type == pycurl.INFOTYPE_TEXT:
-                    logging.getLogger('py-curl').debug(debug_msg.strip())
-
-            handle.setopt(pycurl.VERBOSE, 1)
-            handle.setopt(pycurl.DEBUGFUNCTION, curl_debug_function)
-
-        handle.body = None
-
-        return handle
-
-    @staticmethod
-    def __add_req_headers(handle, *, keep_alive_conn=True, headers=None):
+    def _add_req_headers(curl_handle, *, keep_alive_conn=True, headers=None):
         """Add custom HTTP request headers to the Curl handle.
 
+        :param pycurl.Curl curl_handle: curl handle.
         :param bool keep_alive_conn: whether to pass 'Connection: keep-alive'
                header.
         :param dict headers: HTTP header dictionary.
@@ -244,10 +240,10 @@ class HTTPQueryEngine(object):
             for name, val in headers.items():
                 header_list.append('%s: %s' % (name, val))
 
-        handle.setopt(pycurl.HTTPHEADER, header_list)
+        curl_handle.setopt(pycurl.HTTPHEADER, header_list)
 
     @staticmethod
-    def __make_summary_dict(result, time_start):
+    def _make_summary_dict(result, time_start):
         """Make summary dictionary in format:
 
             {'req_total': total queries done,
@@ -370,9 +366,8 @@ def run_engine(url, num_connections, num_requests, timeout, keep_alive):
     """
 
     with HTTPQueryEngine(url, num_connections=num_connections,
-                         keep_alive_conn=keep_alive,
-                         timeout=timeout) as query:
-        return query.run(num_requests=num_requests)
+                         keep_alive_conn=keep_alive, timeout=timeout) as query:
+        return query(num_requests=num_requests)
 
 
 def parse_args():
@@ -383,7 +378,7 @@ def parse_args():
     """
 
     parser = argparse.ArgumentParser(
-        description='Perform multiple asynchronous queries to the HTTP server.')
+        description='HTTP server benchmark application.')
     parser.add_argument(
         '-c', '--num-connections', metavar='num_connections', type=int,
         help='The number of simultaneous connections per worker process. '
@@ -459,4 +454,5 @@ def main():
 
 
 if __name__ == '__main__':
+
     main()
